@@ -26,6 +26,7 @@ Two execution paths, chosen by the host from the number of routed slots:
   separate launches, with GEMM rows tiled per expert.
 """
 
+import hashlib
 import math
 from typing import Optional
 
@@ -35,6 +36,8 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import torch
 from cutlass.cute.runtime import from_dlpack
+
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 RTPB = 256  # threads per routing / activation / finalize CTA
 BYT = 16  # packed weight bytes per thread per step (one LDG.128 = 32 E2M1 codes)
@@ -54,6 +57,42 @@ GATED_ACTIVATIONS = ("silu", "geglu_tanh")
 # expression with a different sigmoid argument.
 GELU_TANH_C1 = 2.0 * math.sqrt(2.0 / math.pi)
 GELU_TANH_C3 = GELU_TANH_C1 * 0.044715
+
+# Persistent on-disk cache of the compiled kernels (flashinfer/jit/cute_dsl_core.py,
+# docs/design_docs/cute_dsl_kernel_cache.md). The W4A16 and W4A4 modules share
+# one cache module because moe_nvfp4_w4a4 compiles constants defined here: an
+# edit to either file must invalidate both modules' artifacts.
+CUTE_DSL_MODULE = "sm12x_nvfp4_moe"
+
+
+def kernel_source_files() -> tuple[str, ...]:
+    """Sources whose content invalidates the on-disk kernel cache."""
+    from . import moe_nvfp4_w4a4
+
+    return (__file__, moe_nvfp4_w4a4.__file__)
+
+
+def compile_signature(args) -> tuple:
+    """Shape, stride and dtype of each runtime argument of a compiled kernel.
+
+    ``from_dlpack`` bakes all three into the compiled function, so they are
+    codegen parameters like the plan constants.
+    """
+    return tuple((tuple(t.shape), tuple(t.stride()), str(t.dtype)) for t in args)
+
+
+def disk_kernel_name(prefix: str, codegen_key: tuple) -> str:
+    """On-disk name of one compiled kernel.
+
+    The name is the sole per-kernel cache key (the module ``meta.json`` guards
+    only arch, DSL stack and sources), so ``codegen_key`` must hold everything
+    that reaches ``cute.compile``; the digest makes the name injective in it.
+    ``prefix`` is a readable shape summary for humans browsing ``cached_ops/``.
+    Device-derived plan constants (the persistent grid follows the SM count)
+    are in ``codegen_key``, so two GPUs of one arch never share a wrong kernel.
+    """
+    digest = hashlib.sha256(repr(codegen_key).encode()).hexdigest()[:16]
+    return f"{prefix}_{digest}"
 
 
 def resolve_activation(activation: Optional[str], N13: int, I: int) -> str:
@@ -1834,6 +1873,22 @@ def _entry(T, H, I, N13, E, TOPK, dev, activation=None):
     return entry
 
 
+def _disk_name(persistent, consts, args) -> str:
+    """On-disk cache name of the kernel ``run_moe_w4a16`` compiles.
+
+    Everything that reaches ``cute.compile``: the launcher, every plan
+    constant (they include the shape key, the activation flags and, for the
+    persistent launcher, the SM-count-derived grid) and ``args``' shapes,
+    strides and dtypes.
+    """
+    kind = "persistent" if persistent else "tiled"
+    shape = "_".join(f"{k.lower()}{consts[k]}" for k in ("S", "H", "I", "N13", "E"))
+    return disk_kernel_name(
+        f"w4a16_{kind}_{shape}",
+        (kind, tuple(consts.items()), compile_signature(args)),
+    )
+
+
 def allocate_workspace(
     num_tokens: int,
     hidden_size: int,
@@ -1903,9 +1958,11 @@ def run_moe_w4a16(
             both with ``N13 == 2*I``, or ``"relu2"`` with ``N13 == I``;
             ``None`` infers ``"silu"`` / ``"relu2"`` from ``N13``.
 
-    Kernels are specialized and cached per token count, weight geometry and
-    activation; the first call for a new shape compiles and must not run under
-    CUDA graph capture.
+    Kernels are specialized per token count, weight geometry and activation,
+    cached in-process and on disk (see docs/design_docs/cute_dsl_kernel_cache.md;
+    ``FLASHINFER_CUTE_DSL_DISABLE_CACHE=1`` disables the disk cache). The first
+    call for a new shape in a process compiles or loads the kernel and must not
+    run under CUDA graph capture.
     """
     T, H = hidden_states.shape
     E, N13, _ = w13.shape
@@ -1965,10 +2022,19 @@ def run_moe_w4a16(
         )
         launcher = moe_jit
     if compiled is None:
-        fake = [from_dlpack(t, assumed_align=16, enable_tvm_ffi=True) for t in args]
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        compiled = cute.compile(
-            launcher, *fake, stream, *consts.values(), options="--enable-tvm-ffi"
+
+        def compile_kernel():
+            fake = [from_dlpack(t, assumed_align=16, enable_tvm_ffi=True) for t in args]
+            stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+            return cute.compile(
+                launcher, *fake, stream, *consts.values(), options="--enable-tvm-ffi"
+            )
+
+        compiled = build_and_load_cute_dsl_kernel(
+            CUTE_DSL_MODULE,
+            _disk_name(persistent, consts, args),
+            compile_kernel,
+            extra_key_files=kernel_source_files(),
         )
         entry[3] = compiled
     compiled(*args)

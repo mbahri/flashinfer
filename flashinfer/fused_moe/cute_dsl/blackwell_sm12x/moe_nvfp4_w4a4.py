@@ -50,7 +50,17 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 from cutlass.experimental import primitives as prims
 
-from .moe_nvfp4_w4a16 import GELU_TANH_C1, GELU_TANH_C3, resolve_activation
+from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+from .moe_nvfp4_w4a16 import (
+    CUTE_DSL_MODULE,
+    GELU_TANH_C1,
+    GELU_TANH_C3,
+    compile_signature,
+    disk_kernel_name,
+    kernel_source_files,
+    resolve_activation,
+)
 
 FP4 = cutlass.Float4E2M1FN
 E4M3 = cutlass.Float8E4M3FN
@@ -1216,6 +1226,20 @@ def _entry(T, H, I, N13, E, TOPK, dev, activation=None):
     return entry
 
 
+def _disk_name(T, H, I, N13, E, TOPK, act, args) -> str:
+    """On-disk cache name of the kernel ``_entry`` builds for this key.
+
+    ``_build`` is a pure function of the shape key and the activation; ``args``
+    adds what ``from_dlpack`` bakes in (shapes, strides, dtypes). The device is
+    not a parameter: the cache module directory is per compile arch, and no
+    plan value here depends on the device.
+    """
+    return disk_kernel_name(
+        f"w4a4_t{T}_h{H}_i{I}_n{N13}_e{E}_k{TOPK}_{act}",
+        (T, H, I, N13, E, TOPK, act, compile_signature(args)),
+    )
+
+
 def allocate_workspace(
     num_tokens: int,
     hidden_size: int,
@@ -1285,9 +1309,11 @@ def run_moe_w4a4(
             both with ``N13 == 2*I``, or ``"relu2"`` with ``N13 == I``;
             ``None`` infers ``"silu"`` / ``"relu2"`` from ``N13``.
 
-    Requires ``H % 128 == 0`` and ``I % 64 == 0``. Kernels are specialized and
-    cached per token count, geometry and activation; the first call for a new
-    shape compiles and must not run under CUDA graph capture.
+    Requires ``H % 128 == 0`` and ``I % 64 == 0``. Kernels are specialized per
+    token count, geometry and activation, cached in-process and on disk (see
+    docs/design_docs/cute_dsl_kernel_cache.md; ``FLASHINFER_CUTE_DSL_DISABLE_CACHE=1``
+    disables the disk cache). The first call for a new shape in a process
+    compiles or loads the kernel and must not run under CUDA graph capture.
     """
     T, H = hidden_states.shape
     E, N13, _ = w13.shape
@@ -1339,9 +1365,20 @@ def run_moe_w4a4(
         out,
     )
     if compiled is None:
-        fake = [from_dlpack(t, assumed_align=16, enable_tvm_ffi=True) for t in args]
-        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        compiled = cute.compile(prog, *fake, stream, options="--enable-tvm-ffi")
+
+        def compile_kernel():
+            fake = [from_dlpack(t, assumed_align=16, enable_tvm_ffi=True) for t in args]
+            stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+            return cute.compile(prog, *fake, stream, options="--enable-tvm-ffi")
+
+        compiled = build_and_load_cute_dsl_kernel(
+            CUTE_DSL_MODULE,
+            _disk_name(
+                T, H, I, N13, E, TOPK, resolve_activation(activation, N13, I), args
+            ),
+            compile_kernel,
+            extra_key_files=kernel_source_files(),
+        )
         entry[2] = compiled
     compiled(*args)
     return out
